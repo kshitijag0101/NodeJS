@@ -1,10 +1,14 @@
 const fs = require('fs');
 const path = require('path');
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY
+const stripePublicKey = process.env.STRIPE_PUBLIC_KEY
+const stripe = require('stripe')(stripeSecretKey);
 
 const PDFDocument = require('pdfkit');
 
 const Product = require('../models/product');
 const Order = require('../models/order');
+const session = require('express-session');
 
 const ITEMS_PER_PAGE = 2;
 
@@ -22,14 +26,14 @@ exports.getProducts = (req, res, next) => {
         })
         .then(products => {
             res.render('shop/product-list', {
-                prods: products, 
-                pageTitle: 'Products', 
+                prods: products,
+                pageTitle: 'Products',
                 path: '/products',
                 currentPage: page,
                 hasNextPage: ITEMS_PER_PAGE * page < totalItems,
-                hasPreviousPage: page>1,
+                hasPreviousPage: page > 1,
                 nextPage: page + 1,
-                previousPage: page-1,
+                previousPage: page - 1,
                 lastPage: Math.ceil(totalItems / ITEMS_PER_PAGE)
             });
         })
@@ -71,14 +75,14 @@ exports.getIndex = (req, res, next) => {
         })
         .then(products => {
             res.render('shop/index', {
-                prods: products, 
-                pageTitle: 'Shop', 
+                prods: products,
+                pageTitle: 'Shop',
                 path: '/',
                 currentPage: page,
                 hasNextPage: ITEMS_PER_PAGE * page < totalItems,
-                hasPreviousPage: page>1,
+                hasPreviousPage: page > 1,
                 nextPage: page + 1,
-                previousPage: page-1,
+                previousPage: page - 1,
                 lastPage: Math.ceil(totalItems / ITEMS_PER_PAGE)
             });
         })
@@ -93,7 +97,8 @@ exports.getCart = (req, res, next) => {
     req.user
         .populate('cart.items.productId')
         .then(user => {
-            const products = user.cart.items;            res.render('shop/cart', {
+            const products = user.cart.items;
+            res.render('shop/cart', {
                 path: '/cart',
                 pageTitle: 'Your Cart',
                 products: products
@@ -132,12 +137,91 @@ exports.postCartDeleteProduct = (req, res, next) => {
         });
 };
 
+exports.getCheckout = (req, res, next) => {
+    let products;
+    let total = 0;
+    req.user
+        .populate('cart.items.productId')
+        .then(user => {
+            products = user.cart.items;
+            total = 0;
+            products.forEach(p => {
+                total += p.quantity * p.productId.price;
+            });
+            return stripe.checkout.sessions.create({
+                payment_method_types: ["card"],
+                mode: "payment",
+                line_items: products.map((p) => {
+                    return {
+                        quantity: p.quantity,
+                        price_data: {
+                            currency: "inr",
+                            unit_amount: p.productId.price * 100,
+                            product_data: {
+                                name: p.productId.title,
+                                description: p.productId.description,
+                            },
+                        },
+                    };
+                }),
+                customer_email: req.user.email,
+                success_url:
+                    req.protocol + "://" + req.get("host") + "/checkout/success",
+                cancel_url: req.protocol + "://" + req.get("host") + "/checkout/cancel",
+            });
+        })
+        .then(sessions => {
+            res.render('shop/checkout', {
+                path: '/checkout',
+                pageTitle: 'Checkout',
+                products: products,
+                totalSum: total,
+                stripePublicKey: stripePublicKey,
+                sessionId: sessions.id
+            });
+        })
+        .catch(err => {
+            const error = new Error(err);
+            error.httpStatusCode = 500;
+            return next(error);
+        });
+}
+
+exports.getCheckoutSuccess = (req, res, next) => {
+    req.user
+        .populate('cart.items.productId')
+        .then(user => {
+            const products = user.cart.items.map(i => {
+                return { quantity: i.quantity, product: { ...i.productId._doc } };
+            });
+            const order = new Order({
+                user: {
+                    email: req.user.email,
+                    userId: req.user
+                },
+                products: products
+            });
+            return order.save();
+        })
+        .then(result => {
+            req.user.clearCart();
+        })
+        .then(() => {
+            res.redirect('/orders');
+        })
+        .catch(err => {
+            const error = new Error(err);
+            error.httpStatusCode = 500;
+            return next(error);
+        });
+};
+
 exports.postOrder = (req, res, next) => {
     req.user
         .populate('cart.items.productId')
         .then(user => {
             const products = user.cart.items.map(i => {
-                return {quantity: i.quantity, product: { ...i.productId._doc }};
+                return { quantity: i.quantity, product: { ...i.productId._doc } };
             });
             const order = new Order({
                 user: {
@@ -181,10 +265,10 @@ exports.getInvoice = (req, res, next) => {
     const orderId = req.params.orderId;
     Order.findById(orderId)
         .then(order => {
-            if(!order){
+            if (!order) {
                 return next(new Error('No order found.'));
             }
-            if(order.user.userId.toString() !== req.user._id.toString()) {
+            if (order.user.userId.toString() !== req.user._id.toString()) {
                 return next(new Error('Unauthorized'));
             }
             const invoiceName = 'invoice-' + orderId + '.pdf';
@@ -193,7 +277,7 @@ exports.getInvoice = (req, res, next) => {
             const pdfDoc = new PDFDocument();
             res.setHeader('Content-Type', 'application/pdf');
             res.setHeader(
-                'Content-Disposition', 
+                'Content-Disposition',
                 'inline; filename="' + invoiceName + '"'
             );
             pdfDoc.pipe(fs.createWriteStream(invoicePath));
@@ -203,17 +287,17 @@ exports.getInvoice = (req, res, next) => {
                 underline: true
             });
             pdfDoc.text('------------------------');
-            let totalPrice=0;
+            let totalPrice = 0;
             order.products.forEach(prod => {
-                totalPrice += prod.quantity*prod.product.price;
+                totalPrice += prod.quantity * prod.product.price;
                 pdfDoc
                     .fontSize(14)
                     .text(
-                        prod.product.title + 
-                        ' - ' + 
-                        prod.quantity + 
-                        ' x ' + 
-                        '$' + 
+                        prod.product.title +
+                        ' - ' +
+                        prod.quantity +
+                        ' x ' +
+                        '$' +
                         prod.product.price
                     );
             });
